@@ -8,19 +8,18 @@ Responsabilidad única: la interfaz de usuario.
 Ejecutar:  streamlit run app.py      (o doble clic en iniciar_app.bat)
 """
 
+import time
+
 import pandas as pd
 import streamlit as st
 
 from procesador import (
     ErrorValidacion,
-    a_payload,
     batch_id_valido,
     columnas_ignoradas,
     generar_batch_id,
-    leer_archivo,
-    limpiar,
-    mapear_a_sap,
-    validar_rfc,
+    procesar_archivo,
+    unir_archivos,
 )
 from sap_api import SAPClient, SAPError
 
@@ -88,16 +87,16 @@ def probar_conexion() -> None:
         cliente.logout()
 
 
-def subir_a_sap(df: pd.DataFrame) -> dict | None:
+def subir_a_sap(payload_list: list[dict]) -> dict | None:
     """
     Orquesta la carga a SAP:
       try     → login + upsert_lote con barra de progreso en vivo
       except  → muestra el error crítico sin romper la UI
       finally → logout() SIEMPRE, para liberar la licencia SAP.
     """
-    payload_list = a_payload(df)
     barra = st.progress(0.0, text="Iniciando conexión con SAP…")
     estado = st.empty()
+    inicio = time.monotonic()
 
     try:
         cliente = nuevo_cliente()
@@ -111,10 +110,15 @@ def subir_a_sap(df: pd.DataFrame) -> dict | None:
         cliente.login()
 
         def actualizar_progreso(actual: int, total: int) -> None:
-            barra.progress(actual / total, text=f"Procesando registro {actual} de {total}…")
-            estado.info(f"⏳ Enviando a SAP: {actual}/{total} ({actual / total:.0%})")
+            barra.progress(actual / total if total else 1.0,
+                           text=f"Procesando registro {actual} de {total}…")
 
-        resultado = cliente.upsert_lote(payload_list, progress_callback=actualizar_progreso)
+        resultado = cliente.upsert_lote(
+            payload_list,
+            progress_callback=actualizar_progreso,
+            mensaje_callback=estado.info,
+        )
+        resultado["segundos"] = time.monotonic() - inicio
         barra.progress(1.0, text="¡Proceso completado!")
         estado.empty()
         return resultado
@@ -132,18 +136,23 @@ def subir_a_sap(df: pd.DataFrame) -> dict | None:
 
 
 def mostrar_resultado(res: dict, batch_id: str) -> None:
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("✅ Creados", res["creados"])
     c2.metric("🔄 Actualizados", res["actualizados"])
-    c3.metric("❌ Errores", res["errores"])
+    c3.metric("⏭️ Sin cambios", res.get("sin_cambios", 0),
+              help="Ya estaban en SAP con los mismos datos; no se reenviaron.")
+    c4.metric("❌ Errores", res["errores"])
 
+    minutos, segundos = divmod(int(res.get("segundos", 0)), 60)
+    duracion = f" en **{minutos} min {segundos} s**" if "segundos" in res else ""
     if res["errores"] == 0:
         st.success(
-            f"🎉 Lote **{batch_id}** procesado sin errores. "
-            f"Creados: **{res['creados']}** | Actualizados: **{res['actualizados']}**"
+            f"🎉 Lote **{batch_id}** procesado sin errores{duracion}. "
+            f"Creados: **{res['creados']}** | Actualizados: **{res['actualizados']}** | "
+            f"Sin cambios: **{res.get('sin_cambios', 0)}**"
         )
     else:
-        st.warning(f"⚠️ Lote **{batch_id}** procesado con **{res['errores']} error(es)**.")
+        st.warning(f"⚠️ Lote **{batch_id}** procesado{duracion} con **{res['errores']} error(es)**.")
         with st.expander(f"🔍 Ver detalle de {res['errores']} error(es)", expanded=True):
             for msg in res["detalle_errores"]:
                 st.error(msg)
@@ -230,70 +239,98 @@ empresa = st.selectbox(
 )
 st.caption(f"Base de datos SAP destino: **{EMPRESAS_DB[empresa]}**")
 
-archivo = st.file_uploader(
-    "📁 2. Sube el reporte del SAT",
+archivos = st.file_uploader(
+    "📁 2. Sube los reportes del SAT de esta empresa (puedes seleccionar varios a la vez)",
     type=["csv", "xlsx"],
-    help="Las primeras 4 filas del archivo (encabezado del reporte) se omiten automáticamente.",
+    accept_multiple_files=True,
+    help=(
+        "Ejemplo: 'FACTURAS RECIBIDAS' y 'NC RECIBIDAS' juntos. Cada archivo se valida "
+        "por separado y todos se envían en un solo lote. Las primeras 4 filas de cada "
+        "archivo (encabezado del reporte) se omiten automáticamente."
+    ),
 )
 
-if archivo is None:
-    st.info("⬆️ Sube un archivo para comenzar.")
+if not archivos:
+    st.info("⬆️ Sube uno o varios archivos para comenzar.")
     st.stop()
 
 # ── Lectura, validación y transformación (procesador.py) ────────────────────
-error = None
-try:
-    df_raw = leer_archivo(archivo, archivo.name)
-    columna_rfc = validar_rfc(df_raw, EMPRESAS_RFC[empresa])
-    df_base, descartes = limpiar(df_raw)
-    df_sap = mapear_a_sap(df_base)
-except ErrorValidacion as exc:
-    error = str(exc)
-except Exception as exc:  # archivo corrupto, formato inesperado, etc.
-    error = f"No se pudo procesar el archivo: {exc}"
+procesados, errores = [], []
+for archivo in archivos:
+    try:
+        procesados.append(procesar_archivo(archivo, archivo.name, EMPRESAS_RFC[empresa]))
+    except ErrorValidacion as exc:
+        errores.append(str(exc))
+    except Exception as exc:  # archivo corrupto, formato inesperado, etc.
+        errores.append(f"**{archivo.name}**: No se pudo procesar el archivo: {exc}")
 
-if error:
-    st.error(f"❌ {error}")
+if errores:
+    for error in errores:
+        st.error(f"❌ {error}")
     st.stop()
 
-st.success(f"✅ RFC verificado ({columna_rfc}) → **{empresa}**")
+df_sap, payload_list, repetidos_entre_archivos = unir_archivos([p["df_sap"] for p in procesados])
+
+st.success(f"✅ RFC verificado en {len(procesados)} archivo(s) → **{empresa}**")
 
 # ── Trazabilidad – Batch ID para Rollback ───────────────────────────────────
 # Se envía a SAP en U_BatchID. Si hubo un error humano, el lote se revierte
 # desde la barra lateral (DELETE masivo de los registros con ese U_BatchID).
 # Se guarda en session_state para que no cambie entre recargas de la página
-# mientras se trabaja con el mismo archivo.
-clave_archivo = f"{archivo.name}|{archivo.size}|{empresa}"
+# mientras se trabaja con los mismos archivos. Un solo lote para todos ellos.
+clave_archivo = "|".join(sorted(f"{a.name}:{a.size}" for a in archivos)) + f"|{empresa}"
 if st.session_state.get("clave_archivo") != clave_archivo:
     st.session_state["clave_archivo"] = clave_archivo
     st.session_state["batch_id"] = generar_batch_id()
     st.session_state.pop("resultado", None)
 batch_id = st.session_state["batch_id"]
 df_sap["U_BatchID"] = batch_id
+for registro in payload_list:
+    registro["U_BatchID"] = batch_id
 
 # ── Métricas ────────────────────────────────────────────────────────────────
+sin_uuid = sum(p["descartes"]["sin_uuid"] for p in procesados)
+duplicados = sum(p["descartes"]["duplicados"] for p in procesados)
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("📄 Registros a enviar", len(df_sap))
-c2.metric("🗂️ Campos SAP", len(df_sap.columns))
-c3.metric("🚫 Descartados", descartes["sin_uuid"] + descartes["duplicados"])
+c1.metric("📄 Registros a enviar", len(payload_list))
+c2.metric("📁 Archivos", len(procesados))
+c3.metric("🚫 Descartados", sin_uuid + duplicados + repetidos_entre_archivos)
 c4.metric("🔖 Batch ID", batch_id)
 
-if descartes["sin_uuid"]:
-    st.warning(f"Se omitieron {descartes['sin_uuid']} fila(s) sin UUID.")
-if descartes["duplicados"]:
-    st.warning(f"Se omitieron {descartes['duplicados']} UUID(s) repetido(s) en el archivo (se conservó el último).")
-ignoradas = columnas_ignoradas(df_base)
-if ignoradas:
-    with st.expander(f"ℹ️ {len(ignoradas)} columna(s) del archivo no se envían a SAP"):
-        st.write(", ".join(ignoradas))
+st.dataframe(
+    pd.DataFrame([
+        {
+            "Archivo": p["nombre"],
+            "Registros": len(p["df_sap"]),
+            "Campos SAP": len(p["df_sap"].columns),
+            "RFC verificado en": p["columna_rfc"],
+        }
+        for p in procesados
+    ]),
+    width="stretch",
+    hide_index=True,
+)
+
+if sin_uuid:
+    st.warning(f"Se omitieron {sin_uuid} fila(s) sin UUID.")
+if duplicados:
+    st.warning(f"Se omitieron {duplicados} UUID(s) repetido(s) dentro de un mismo archivo (se conservó el último).")
+if repetidos_entre_archivos:
+    st.warning(f"{repetidos_entre_archivos} UUID(s) venían en más de un archivo; se conservó el del último archivo.")
+for p in procesados:
+    ignoradas = columnas_ignoradas(p["df_base"])
+    if ignoradas:
+        with st.expander(f"ℹ️ {p['nombre']}: {len(ignoradas)} columna(s) no se envían a SAP"):
+            st.write(", ".join(ignoradas))
 
 st.subheader("📋 3. Revisa los datos (ya en formato SAP)")
 st.dataframe(df_sap, width="stretch", hide_index=True)
 
-if "Estatus" in df_base.columns:
+estatus = pd.concat([p["df_base"]["Estatus"] for p in procesados if "Estatus" in p["df_base"].columns])
+if not estatus.empty:
     st.caption(
         "Estatus incluidos: "
-        + ", ".join(f"{k}: {v}" for k, v in df_base["Estatus"].value_counts(dropna=False).items())
+        + ", ".join(f"{k}: {v}" for k, v in estatus.value_counts(dropna=False).items())
     )
 
 st.divider()
@@ -303,19 +340,19 @@ with col_a:
     if st.button(
         "🔍 Generar Payload de Prueba",
         width="stretch",
-        disabled=df_sap.empty,
+        disabled=not payload_list,
         help="Muestra los primeros 3 registros en el JSON exacto que recibe SAP.",
     ):
-        st.json(a_payload(df_sap.head(3)))
+        st.json(payload_list[:3])
 
 with col_b:
     if st.button(
         "🚀 4. Subir datos a SAP B1",
         type="primary",
         width="stretch",
-        disabled=df_sap.empty,
+        disabled=not payload_list,
     ):
-        resultado = subir_a_sap(df_sap)
+        resultado = subir_a_sap(payload_list)
         if resultado is not None:
             st.session_state["resultado"] = resultado
             st.session_state["ultimo_lote_subido"] = batch_id

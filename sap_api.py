@@ -3,7 +3,7 @@ sap_api.py – Cliente HTTP para SAP Business One Service Layer
 =============================================================
 Responsabilidad única: encapsular TODA la comunicación con SAP B1.
   - Autenticación / cierre de sesión (manejo de la licencia)
-  - Upsert por lote (GET → PATCH si existe, POST si no existe)
+  - Upsert por lote: descarga única de existentes + POST/PATCH en $batch
   - Rollback de un lote completo por U_BatchID
   - Verificación / creación del campo U_BatchID en la UDT
 
@@ -12,9 +12,12 @@ Este módulo NO conoce Streamlit; es agnóstico de la UI.
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 import urllib3
@@ -42,6 +45,10 @@ PATRON_BATCH_ID = re.compile(r"^LOTE_\d{8}_\d{4}$")
 #    antes (que solo fueron actualizadas).
 CAMPOS_NO_ACTUALIZABLES = ("Code", "U_BatchID")
 
+# Operaciones por petición $batch. Medido en este Service Layer:
+# 100 POST ≈ 5 s (vs ~0.5 s por registro con peticiones individuales).
+TAMANO_BATCH = 100
+
 
 class SAPError(Exception):
     """Error de comunicación o de negocio devuelto por SAP Service Layer."""
@@ -56,6 +63,53 @@ def _mensaje_error(resp: requests.Response) -> str:
         return f"HTTP {resp.status_code} (código SAP {err.get('code')}): {texto}"
     except ValueError:
         return f"HTTP {resp.status_code}: {resp.text[:300]}"
+
+
+def _error_de_texto(status: int, texto: str) -> str:
+    """Igual que _mensaje_error, pero para una respuesta dentro de un $batch."""
+    try:
+        err = json.loads(texto).get("error", {})
+        msg = err.get("message", {})
+        valor = msg.get("value") if isinstance(msg, dict) else str(msg)
+        return f"HTTP {status} (código SAP {err.get('code')}): {valor}"
+    except (ValueError, AttributeError):
+        return f"HTTP {status}: {texto[:300]}" if status else texto[:300]
+
+
+_FECHA_SAP = re.compile(r"^\d{4}-\d{2}-\d{2}T")   # SAP devuelve '2025-07-14T00:00:00Z'
+
+
+def _normalizar(valor):
+    if valor is None:
+        return None
+    if isinstance(valor, str):
+        # SAP guarda los saltos de línea de los campos memo como '\r'
+        valor = valor.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if _FECHA_SAP.match(valor):
+            valor = valor[:10]
+        return valor or None
+    if isinstance(valor, bool):
+        return valor
+    if isinstance(valor, (int, float)):
+        return float(valor)
+    return valor
+
+
+def _iguales(nuevo, actual) -> bool:
+    """
+    ¿El valor del archivo es igual al que ya tiene SAP?
+    - Fechas: compara solo YYYY-MM-DD.
+    - Importes: tolerancia de medio centavo; null y 0 se consideran iguales
+      (SAP devuelve 0.0 en campos numéricos vacíos).
+    - Texto: sin espacios laterales; '' y null son iguales.
+    """
+    a, b = _normalizar(nuevo), _normalizar(actual)
+    if isinstance(a, float) or isinstance(b, float):
+        try:
+            return abs(float(a or 0.0) - float(b or 0.0)) < 0.005
+        except (TypeError, ValueError):
+            return False
+    return a == b
 
 
 class SAPClient:
@@ -219,49 +273,183 @@ class SAPClient:
             raise SAPError(f"No se pudo crear el campo U_BatchID. {_mensaje_error(resp)}")
 
     # -----------------------------------------------------------------------
+    # $batch: varias operaciones en UNA petición HTTP
+    # -----------------------------------------------------------------------
+    def _batch(self, ops: list[tuple[str, str, dict | None]]) -> list[tuple[int, str]]:
+        """
+        Envía [(método, ruta, cuerpo)] en una sola petición OData $batch.
+        Devuelve [(status, cuerpo_respuesta)] en el mismo orden.
+
+        IMPORTANTE (verificado en este Service Layer): si una operación falla,
+        SAP DETIENE el lote y no ejecuta las siguientes; por eso la lista
+        devuelta puede ser más corta que `ops` (ver _ejecutar).
+        """
+        frontera = f"batch_{uuid.uuid4().hex}"
+        ruta_base = urlparse(self.base_url).path.rstrip("/")     # /b1s/v1
+        partes = []
+        for metodo, ruta, cuerpo in ops:
+            lineas = [f"--{frontera}", "Content-Type: application/http",
+                      "Content-Transfer-Encoding: binary", "", f"{metodo} {ruta_base}/{ruta}"]
+            if cuerpo is not None:
+                lineas += ["Content-Type: application/json", "", json.dumps(cuerpo)]
+            else:
+                lineas += [""]
+            partes.append("\r\n".join(lineas))
+        datos = "\r\n".join(partes) + f"\r\n--{frontera}--\r\n"
+
+        resp = self._request(
+            "POST", "$batch", data=datos.encode("utf-8"),
+            headers={"Content-Type": f"multipart/mixed;boundary={frontera}"},
+        )
+        if resp.status_code not in (200, 202):
+            raise SAPError(f"Petición $batch rechazada. {_mensaje_error(resp)}")
+
+        m = re.search(r'boundary="?([^";]+)"?', resp.headers.get("Content-Type", ""))
+        if not m:
+            raise SAPError("Respuesta $batch inesperada de SAP (sin boundary).")
+        texto = resp.content.decode("utf-8", errors="replace")
+        resultados = []
+        for parte in texto.split(f"--{m.group(1)}"):
+            estado = re.search(r"HTTP/1\.\d\s+(\d{3})", parte)
+            if not estado:
+                continue
+            resto = re.split(r"\r?\n\r?\n", parte[estado.end():], maxsplit=1)
+            resultados.append((int(estado.group(1)), resto[1].strip() if len(resto) > 1 else ""))
+        return resultados
+
+    def _ejecutar(self, ops: list[dict], avance=None) -> list[tuple[dict, int, str]]:
+        """
+        Ejecuta operaciones {'metodo','ruta','cuerpo',...} en bloques de
+        TAMANO_BATCH. Como SAP detiene el bloque en el primer error, se reanuda
+        justo después de la operación que falló, sin perder ni repetir ninguna.
+        avance(n_procesadas) se invoca tras cada bloque.
+        """
+        resultados: list[tuple[dict, int, str]] = []
+        i = 0
+        while i < len(ops):
+            bloque = ops[i:i + TAMANO_BATCH]
+            try:
+                respuestas = self._batch([(o["metodo"], o["ruta"], o["cuerpo"]) for o in bloque])
+            except SAPError as exc:
+                # Falla del bloque completo (red, timeout…): se reporta y se sigue.
+                # Volver a subir el archivo corrige lo pendiente (el upsert es idempotente).
+                respuestas = [(0, str(exc))] * len(bloque)
+            if not respuestas:
+                respuestas = [(0, "SAP no devolvió respuesta para esta operación.")]
+            respuestas = respuestas[:len(bloque)]
+            resultados.extend((op, status, cuerpo) for op, (status, cuerpo) in zip(bloque, respuestas))
+            i += len(respuestas)
+            if avance:
+                avance(len(resultados))
+        return resultados
+
+    # -----------------------------------------------------------------------
     # Upsert por lote
     # -----------------------------------------------------------------------
-    def upsert_lote(self, payload_list: list[dict], progress_callback=None) -> dict:
+    def registros_existentes(self, campos) -> dict[str, dict]:
         """
-        Por cada registro:
-          GET /U_<TABLA>('<Code>') → 200 → PATCH (actualizar, sin Code ni U_BatchID)
-                                   → 404 → POST  (crear, con U_BatchID)
-        progress_callback(actual, total) se invoca tras cada registro.
+        Descarga en páginas de 1000 TODOS los registros de la UDT (solo los
+        campos indicados). Reemplaza miles de GET individuales por unas
+        cuantas peticiones (~20 s para 33,000 registros).
+        Llave: Code en MAYÚSCULAS.
+        """
+        select = ",".join(sorted({"Code", *campos}))
+        existentes: dict[str, dict] = {}
+        siguiente, params = self.entidad, {"$select": select}
+        while siguiente:
+            resp = self._request("GET", siguiente, params=params,
+                                 headers={"Prefer": "odata.maxpagesize=1000"})
+            if resp.status_code != 200:
+                raise SAPError(f"No se pudieron leer los registros existentes. {_mensaje_error(resp)}")
+            datos = resp.json()
+            for r in datos.get("value", []):
+                existentes[str(r["Code"]).upper()] = r
+            siguiente = datos.get("odata.nextLink") or datos.get("@odata.nextLink")
+            params = None   # el nextLink ya incluye $select
+        return existentes
 
-        Returns: {'creados', 'actualizados', 'errores', 'detalle_errores'}
+    def upsert_lote(self, payload_list: list[dict], progress_callback=None,
+                    mensaje_callback=None) -> dict:
+        """
+        Carga optimizada (antes: GET + POST/PATCH individuales por registro):
+
+          1. Descarga una sola vez los registros que ya existen en SAP.
+          2. Clasifica cada registro:
+               - no existe            → POST  (crear, con U_BatchID)
+               - existe con cambios   → PATCH solo con los campos distintos
+               - existe idéntico      → se omite (no se envía nada)
+          3. Envía los POST/PATCH en bloques $batch de TAMANO_BATCH.
+          4. Si un POST falla porque el registro ya existía (-2035), se
+             reintenta como PATCH.
+
+        progress_callback(actual, total) · mensaje_callback(texto)
+        Returns: {'creados', 'actualizados', 'sin_cambios', 'errores', 'detalle_errores'}
         """
         total = len(payload_list)
-        res = {"creados": 0, "actualizados": 0, "errores": 0, "detalle_errores": []}
+        res = {"creados": 0, "actualizados": 0, "sin_cambios": 0, "errores": 0, "detalle_errores": []}
 
+        def avisar(texto: str) -> None:
+            if mensaje_callback:
+                mensaje_callback(texto)
+
+        campos = {k for r in payload_list for k in r if k not in CAMPOS_NO_ACTUALIZABLES}
+        avisar("🔎 Consultando los registros que ya existen en SAP…")
+        existentes = self.registros_existentes(campos)
+
+        ops: list[dict] = []
         for idx, registro in enumerate(payload_list, start=1):
             code = str(registro.get("Code") or "").strip()
-            try:
-                if not code:
-                    raise SAPError("Registro sin Code (UUID vacío).")
-                ruta = f"{self.entidad}('{self._llave(code)}')"
-
-                existe = self._request("GET", ruta, params={"$select": "Code"})
-                if existe.status_code == 200:
-                    cuerpo = {k: v for k, v in registro.items() if k not in CAMPOS_NO_ACTUALIZABLES}
-                    resp = self._request("PATCH", ruta, json=cuerpo)
-                    if resp.status_code not in (200, 204):
-                        raise SAPError(f"Actualización fallida. {_mensaje_error(resp)}")
-                    res["actualizados"] += 1
-                elif existe.status_code == 404:
-                    resp = self._request("POST", self.entidad, json=registro)
-                    if resp.status_code not in (200, 201, 204):
-                        raise SAPError(f"Creación fallida. {_mensaje_error(resp)}")
-                    res["creados"] += 1
-                else:
-                    raise SAPError(f"Consulta fallida. {_mensaje_error(existe)}")
-
-            except SAPError as exc:
+            if not code:
                 res["errores"] += 1
-                res["detalle_errores"].append(f"[{code or f'FILA_{idx}'}] {exc}")
-            finally:
-                if progress_callback:
-                    progress_callback(idx, total)
+                res["detalle_errores"].append(f"[FILA_{idx}] Registro sin Code (UUID vacío).")
+                continue
+            actual = existentes.get(code.upper())
+            if actual is None:
+                ops.append({"tipo": "crear", "code": code, "metodo": "POST",
+                            "ruta": self.entidad, "cuerpo": registro})
+                continue
+            cambios = {k: v for k, v in registro.items()
+                       if k not in CAMPOS_NO_ACTUALIZABLES and not _iguales(v, actual.get(k))}
+            if cambios:
+                ops.append({"tipo": "actualizar", "code": code, "metodo": "PATCH",
+                            "ruta": f"{self.entidad}('{self._llave(actual['Code'])}')",
+                            "cuerpo": cambios})
+            else:
+                res["sin_cambios"] += 1
 
+        ya_resueltos = res["sin_cambios"] + res["errores"]
+        if progress_callback:
+            progress_callback(ya_resueltos, total)
+        n_crear = sum(op["tipo"] == "crear" for op in ops)
+        avisar(f"🚀 Enviando a SAP: {n_crear} nuevo(s), {len(ops) - n_crear} con cambios, "
+               f"{res['sin_cambios']} sin cambios (se omiten)…")
+
+        avance = (lambda n: progress_callback(min(ya_resueltos + n, total), total)) if progress_callback else None
+        reintentos: list[dict] = []
+        for op, status, cuerpo in self._ejecutar(ops, avance):
+            if status in (200, 201, 204):
+                res["creados" if op["tipo"] == "crear" else "actualizados"] += 1
+            elif op["tipo"] == "crear" and "-2035" in cuerpo:
+                # Ya existía (p. ej. lo creó un bloque que expiró por timeout).
+                reintentos.append({
+                    "tipo": "actualizar", "code": op["code"], "metodo": "PATCH",
+                    "ruta": f"{self.entidad}('{self._llave(op['code'])}')",
+                    "cuerpo": {k: v for k, v in op["cuerpo"].items() if k not in CAMPOS_NO_ACTUALIZABLES},
+                })
+            else:
+                accion = "Creación" if op["tipo"] == "crear" else "Actualización"
+                res["errores"] += 1
+                res["detalle_errores"].append(f"[{op['code']}] {accion} fallida. {_error_de_texto(status, cuerpo)}")
+
+        for op, status, cuerpo in self._ejecutar(reintentos):
+            if status in (200, 204):
+                res["actualizados"] += 1
+            else:
+                res["errores"] += 1
+                res["detalle_errores"].append(f"[{op['code']}] Actualización fallida. {_error_de_texto(status, cuerpo)}")
+
+        if progress_callback:
+            progress_callback(total, total)
         return res
 
     # -----------------------------------------------------------------------
@@ -292,25 +480,24 @@ class SAPClient:
 
     def eliminar_lote(self, batch_id: str, progress_callback=None) -> dict:
         """
-        Rollback: elimina (DELETE) todos los registros creados por el lote.
+        Rollback: elimina (DELETE) todos los registros creados por el lote,
+        enviados en bloques $batch.
         Returns: {'eliminados', 'errores', 'detalle_errores'}
         """
         codes = self.codes_de_lote(batch_id)
         total = len(codes)
         res = {"eliminados": 0, "errores": 0, "detalle_errores": []}
+        ops = [
+            {"tipo": "eliminar", "code": code, "metodo": "DELETE",
+             "ruta": f"{self.entidad}('{self._llave(code)}')", "cuerpo": None}
+            for code in codes
+        ]
+        avance = (lambda n: progress_callback(n, total)) if progress_callback else None
 
-        for idx, code in enumerate(codes, start=1):
-            try:
-                resp = self._request("DELETE", f"{self.entidad}('{self._llave(code)}')")
-                if resp.status_code in (200, 204):
-                    res["eliminados"] += 1
-                else:
-                    raise SAPError(_mensaje_error(resp))
-            except SAPError as exc:
+        for op, status, cuerpo in self._ejecutar(ops, avance):
+            if status in (200, 204):
+                res["eliminados"] += 1
+            else:
                 res["errores"] += 1
-                res["detalle_errores"].append(f"[{code}] {exc}")
-            finally:
-                if progress_callback:
-                    progress_callback(idx, total)
-
+                res["detalle_errores"].append(f"[{op['code']}] {_error_de_texto(status, cuerpo)}")
         return res

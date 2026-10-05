@@ -123,6 +123,25 @@ def test_fechas_dia_primero():
     assert convertir_fecha_iso(pd.Series(["03/04/2026"])).tolist() == ["2026-04-03"]
 
 
+def test_fechas_iso_no_intercambian_dia_y_mes():
+    # Regresión: Excel entrega '2026-09-11 00:00:00' (11 de septiembre) y antes
+    # se convertía en '2026-11-09' por interpretarla con 'día primero'.
+    serie = pd.Series(["2026-09-11 00:00:00", "2026-02-09", "11/09/2026"])
+    assert convertir_fecha_iso(serie).tolist() == ["2026-09-11", "2026-02-09", "2026-09-11"]
+
+
+def test_xlsx_con_celdas_de_fecha_real():
+    buffer = io.BytesIO()
+    relleno = pd.DataFrame([["Reporte"], ["ESI151228L26"], ["y"], ["z"]])
+    datos = pd.DataFrame({"UUID": ["U1", "U2"],
+                          "Emisión": [datetime(2026, 9, 11), "02/08/2026"]})
+    with pd.ExcelWriter(buffer, engine="openpyxl") as w:
+        relleno.to_excel(w, index=False, header=False, startrow=0)
+        datos.to_excel(w, index=False, startrow=4)
+    leido = leer_archivo(io.BytesIO(buffer.getvalue()), "r.xlsx")
+    assert convertir_fecha_iso(leido["Emisión"]).tolist() == ["2026-09-11", "2026-08-02"]
+
+
 # ── Números ─────────────────────────────────────────────────────────────────
 def test_numeros():
     assert convertir_numero(pd.Series(["$1,234.50", "", None, "abc", "7"])).tolist() == [

@@ -98,6 +98,10 @@ ALIAS_COLUMNAS = {
     "rfc_receptor":            "Receptor RFC",
     "forma_de_pago":           "Forma Pago",
     "metodo_de_pago":          "Metodo Pago",
+    # El reporte del SAT abrevia los impuestos locales:
+    "impto_loc_tras":          "Impuesto Local",     # 'Impto. Loc. Tras.'
+    "impuesto_local_trasladado": "Impuesto Local",
+    "impto_loc_ret":           "Impuesto Local R",   # 'Impto. Loc. Ret.'
 }
 
 PATRON_BATCH_ID = re.compile(r"^LOTE_\d{8}_\d{4}$")
@@ -147,7 +151,13 @@ def leer_archivo(archivo, nombre_archivo: str) -> pd.DataFrame:
     - Los encabezados se normalizan a los nombres canónicos del mapeo
       (tolera acentos, mayúsculas, guiones bajos y espacios extra).
     """
-    datos = archivo.read() if hasattr(archivo, "read") else open(archivo, "rb").read()
+    if hasattr(archivo, "getvalue"):          # UploadedFile de Streamlit / BytesIO
+        datos = archivo.getvalue()
+    elif hasattr(archivo, "read"):
+        datos = archivo.read()
+    else:
+        with open(archivo, "rb") as f:
+            datos = f.read()
     nombre = nombre_archivo.lower()
     encabezado_raw = ""
 
@@ -280,16 +290,24 @@ def convertir_fecha_iso(serie: pd.Series) -> pd.Series:
     """
     'DD/MM/YYYY' → 'YYYY-MM-DD' (formato ISO que exige SAP Service Layer).
 
-    1. Intenta el formato exacto DD/MM/YYYY.
-    2. Lo que no coincida (ej. con hora, o ya en ISO desde Excel) se infiere
-       con dayfirst=True.
-    3. Vacíos o inválidos (NaT) → None, que en JSON se convierte en null.
+    1. Intenta el formato exacto DD/MM/YYYY (texto del reporte del SAT).
+    2. Fechas ya en ISO 'YYYY-MM-DD[ HH:MM:SS]': así llegan las celdas que
+       Excel guarda como FECHA real. Se leen tal cual, SIN 'día primero'
+       (antes se interpretaban con dayfirst y se intercambiaban día y mes:
+       '2026-09-11' → '2026-11-09').
+    3. Cualquier otro formato se infiere con dayfirst=True.
+    4. Vacíos o inválidos (NaT) → None, que en JSON se convierte en null.
        (strftime convertiría NaT en el texto 'NaT', que SAP rechaza).
     """
-    texto = serie.astype("string")
+    texto = serie.astype("string").str.strip()
     fechas = pd.to_datetime(texto, format="%d/%m/%Y", errors="coerce")
 
-    pendientes = fechas.isna() & texto.notna()
+    es_iso = texto.str.match(r"^\d{4}-\d{2}-\d{2}", na=False) & fechas.isna()
+    if es_iso.any():
+        iso_parseadas = pd.to_datetime(texto[es_iso].str[:10], format="%Y-%m-%d", errors="coerce")
+        fechas = fechas.where(~es_iso, iso_parseadas)
+
+    pendientes = fechas.isna() & texto.notna() & ~es_iso
     if pendientes.any():
         inferidas = pd.to_datetime(
             texto[pendientes], dayfirst=True, format="mixed", errors="coerce"
@@ -377,3 +395,50 @@ def a_payload(df: pd.DataFrame) -> list[dict]:
         {k: _valor_nativo(v) for k, v in registro.items()}
         for registro in df.to_dict(orient="records")
     ]
+
+
+# ===========================================================================
+# 7. Varios archivos de la misma empresa (p. ej. Facturas + Notas de Crédito)
+# ===========================================================================
+def procesar_archivo(archivo, nombre_archivo: str, rfc_esperado: str) -> dict:
+    """
+    Lee, valida el RFC, limpia y mapea UN archivo.
+    Los errores se relanzan con el nombre del archivo para que la contadora
+    sepa exactamente cuál revisar.
+    """
+    try:
+        df_raw = leer_archivo(archivo, nombre_archivo)
+        columna_rfc = validar_rfc(df_raw, rfc_esperado)
+        df_base, descartes = limpiar(df_raw)
+        df_sap = mapear_a_sap(df_base)
+    except ErrorValidacion as exc:
+        raise ErrorValidacion(f"**{nombre_archivo}**: {exc}") from exc
+    return {
+        "nombre": nombre_archivo,
+        "columna_rfc": columna_rfc,
+        "df_base": df_base,
+        "df_sap": df_sap,
+        "descartes": descartes,
+    }
+
+
+def unir_archivos(dfs_sap: list[pd.DataFrame]) -> tuple[pd.DataFrame, list[dict], int]:
+    """
+    Une los DataFrames (ya en formato SAP) de varios archivos de la misma empresa.
+
+    - Payload: cada registro conserva SOLO las columnas de SU archivo. Así, un
+      archivo con menos columnas (p. ej. Notas de Crédito, sin 'Forma Pago')
+      no envía null en esos campos y no borra información existente en SAP.
+      Resultado idéntico a subir los archivos por separado.
+    - UUID repetidos entre archivos: se conserva el del último archivo.
+    - Vista previa: unión de columnas de todos los archivos.
+
+    Returns: (vista_previa, payload_list, uuids_repetidos_entre_archivos)
+    """
+    por_code: dict[str, dict] = {}
+    for df in dfs_sap:
+        for registro in a_payload(df):
+            por_code[registro["Code"]] = registro
+    total = sum(len(df) for df in dfs_sap)
+    vista = pd.concat(dfs_sap, ignore_index=True).drop_duplicates("Code", keep="last")
+    return vista.reset_index(drop=True), list(por_code.values()), total - len(por_code)

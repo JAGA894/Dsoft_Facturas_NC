@@ -14,7 +14,7 @@ def test_app_arranca_sin_errores():
     assert not at.exception
     assert len(at.selectbox) == 1
     assert "ERSA SOLUCIONES INTEGRALES" in at.selectbox[0].options
-    assert any("Sube un archivo" in i.value for i in at.info)
+    assert any("Sube uno o varios archivos" in i.value for i in at.info)
 
 
 def test_boton_eliminar_lote_bloqueado_sin_confirmacion():
