@@ -43,8 +43,31 @@ EMPRESAS_RFC = {
     "CONSTRUCCIONES SBA":             "CSB1201163D6",
     "ERSAGRO SOLUCIONES":             "ESO210513J13",
     "EUGENIO RICARDO STERLING ARANA": "SEAE8106183T6",
+    "EUGENIO RICARDO STERLING BOURS": "SEBE541109MA5",
     "GRUPO JEUMA":                    "GJE1512285G9",
 }
+
+# Empresa → base de datos SAP (CompanyDB) donde se cargan sus facturas.
+# Verificado contra SAP leyendo el RFC (FederalTaxID) de cada base.
+# Cada base debe estar listada también en SAP_COMPANYDB del .env.
+EMPRESAS_DB = {
+    "ERSA SOLUCIONES INTEGRALES":     "ERSA_PRODUCTIVA",
+    "CONSTRUCCIONES SBA":             "SBA_PROD",
+    "ERSAGRO SOLUCIONES":             "ERSAGRO_PROD",
+    "EUGENIO RICARDO STERLING ARANA": "SA_PRODUCTIVA",
+    "EUGENIO RICARDO STERLING BOURS": "SB_PROD",
+    "GRUPO JEUMA":                    "JEUMA_PRODUCTIVA",
+}
+
+
+def empresa_seleccionada() -> str:
+    """Empresa elegida en el selector (la barra lateral se dibuja antes que él)."""
+    return st.session_state.get("empresa") or next(iter(EMPRESAS_RFC))
+
+
+def nuevo_cliente() -> SAPClient:
+    """SAPClient conectado a la base de datos de la empresa seleccionada."""
+    return SAPClient(company_db=EMPRESAS_DB[empresa_seleccionada()])
 
 
 # ===========================================================================
@@ -52,7 +75,7 @@ EMPRESAS_RFC = {
 # ===========================================================================
 def probar_conexion() -> None:
     try:
-        cliente = SAPClient()
+        cliente = nuevo_cliente()
     except SAPError as exc:
         st.error(f"❌ {exc}")
         return
@@ -77,7 +100,7 @@ def subir_a_sap(df: pd.DataFrame) -> dict | None:
     estado = st.empty()
 
     try:
-        cliente = SAPClient()
+        cliente = nuevo_cliente()
     except SAPError as exc:
         barra.empty()
         st.error(f"❌ {exc}")
@@ -131,7 +154,7 @@ def mostrar_resultado(res: dict, batch_id: str) -> None:
 
 def revertir_lote(batch_id: str) -> None:
     try:
-        cliente = SAPClient()
+        cliente = nuevo_cliente()
     except SAPError as exc:
         st.error(f"❌ {exc}")
         return
@@ -166,6 +189,7 @@ def revertir_lote(batch_id: str) -> None:
 # ===========================================================================
 with st.sidebar:
     st.header("⚙️ Herramientas")
+    st.caption(f"Empresa activa: **{empresa_seleccionada()}** → base **{EMPRESAS_DB[empresa_seleccionada()]}**")
     if st.button("🔌 Probar conexión con SAP", width="stretch"):
         probar_conexion()
 
@@ -202,7 +226,9 @@ empresa = st.selectbox(
     "🏢 1. Selecciona la empresa",
     options=list(EMPRESAS_RFC.keys()),
     help="El RFC de esta empresa debe coincidir con el del archivo.",
+    key="empresa",
 )
+st.caption(f"Base de datos SAP destino: **{EMPRESAS_DB[empresa]}**")
 
 archivo = st.file_uploader(
     "📁 2. Sube el reporte del SAT",

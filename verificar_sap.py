@@ -8,8 +8,10 @@ Uso (desde la carpeta del proyecto):
 
 Revisa: variables del .env, login, existencia de la UDT y que todos los
 campos que la app envía existan en SAP. Siempre cierra la sesión al final.
+Si SAP_COMPANYDB contiene varias bases separadas por comas, revisa cada una.
 """
 
+import os
 import sys
 
 from procesador import MAPEO_COLUMNAS, MAPEO_OPCIONAL
@@ -18,19 +20,15 @@ from sap_api import SAPClient, SAPError
 OK, FALLA, AVISO = "[ OK ]", "[FALLA]", "[AVISO]"
 
 
-def main() -> int:
-    crear = "--crear-campos" in sys.argv
-    print("=" * 64)
-    print(" Diagnóstico SAP B1 Service Layer")
-    print("=" * 64)
-
+def revisar_base(company_db: str, crear: bool) -> bool:
+    """Revisa una base de datos. Devuelve True si está lista para cargar."""
+    print("-" * 64)
     try:
-        sap = SAPClient()
+        sap = SAPClient(company_db=company_db)
     except SAPError as exc:
         print(f"{FALLA} {exc}")
-        return 1
+        return False
 
-    print(f"{OK} .env cargado  → URL: {sap.base_url}")
     print(f"       Base de datos: {sap.company_db} | Usuario: {sap.user} | Tabla: @{sap.tabla}")
 
     try:
@@ -39,7 +37,7 @@ def main() -> int:
 
         if not sap.tabla_existe():
             print(f"{FALLA} La tabla @{sap.tabla} no existe en SAP.")
-            return 1
+            return False
         print(f"{OK} La tabla @{sap.tabla} existe (endpoint /{sap.entidad})")
 
         campos = set(sap.campos_udt())
@@ -60,18 +58,39 @@ def main() -> int:
             print(f"{OK} Campo U_BatchID CREADO en @{sap.tabla}")
         else:
             print(f"{FALLA} Falta el campo U_BatchID. Ejecuta: python verificar_sap.py --crear-campos")
-            return 1
-
-        print("-" * 64)
-        print(" Todo en orden. La aplicación puede cargar datos a SAP.")
-        return 0
+            return False
+        return True
 
     except SAPError as exc:
         print(f"{FALLA} {exc}")
-        return 1
+        return False
     finally:
         sap.logout()
         print("       Sesión SAP cerrada.")
+
+
+def main() -> int:
+    crear = "--crear-campos" in sys.argv
+    print("=" * 64)
+    print(" Diagnóstico SAP B1 Service Layer")
+    print("=" * 64)
+
+    bases = [b.strip() for b in os.getenv("SAP_COMPANYDB", "").split(",") if b.strip()]
+    if not bases:
+        print(f"{FALLA} Falta SAP_COMPANYDB en el archivo .env")
+        return 1
+    print(f"{OK} .env cargado  → URL: {os.getenv('SAP_URL', '').strip()}")
+    print(f"       Bases a revisar: {', '.join(bases)}")
+
+    resultados = {db: revisar_base(db, crear) for db in bases}
+
+    print("=" * 64)
+    for db, listo in resultados.items():
+        print(f"{OK if listo else FALLA} {db}")
+    if all(resultados.values()):
+        print(" Todo en orden. La aplicación puede cargar datos a SAP.")
+        return 0
+    return 1
 
 
 if __name__ == "__main__":

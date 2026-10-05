@@ -68,9 +68,27 @@ class SAPClient:
       como context manager:  with SAPClient() as sap: ...
     """
 
-    def __init__(self, timeout: int = 60):
+    def __init__(self, timeout: int = 60, company_db: str | None = None):
         self.base_url = os.getenv("SAP_URL", "").strip().rstrip("/")
-        self.company_db = os.getenv("SAP_COMPANYDB", "").strip()
+        # SAP_COMPANYDB puede ser UNA base o VARIAS separadas por comas
+        # (una por empresa). Si es lista, funciona como lista de bases permitidas
+        # y la app indica cuál usar según la empresa seleccionada.
+        bases_env = [b.strip() for b in os.getenv("SAP_COMPANYDB", "").split(",") if b.strip()]
+        if company_db:
+            company_db = company_db.strip()
+            if bases_env and company_db not in bases_env:
+                raise SAPError(
+                    f"La base de datos '{company_db}' no está en SAP_COMPANYDB del .env "
+                    f"({', '.join(bases_env)})."
+                )
+            self.company_db = company_db
+        elif len(bases_env) > 1:
+            raise SAPError(
+                "SAP_COMPANYDB del .env contiene varias bases de datos; "
+                "se debe indicar cuál usar según la empresa seleccionada."
+            )
+        else:
+            self.company_db = bases_env[0] if bases_env else ""
         self.user = os.getenv("SAP_USER", "").strip()
         self.password = os.getenv("SAP_PASSWORD", "")
         udt = os.getenv("SAP_UDT", "").strip().lstrip("@")
