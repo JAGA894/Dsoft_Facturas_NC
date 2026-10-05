@@ -149,9 +149,15 @@ def leer_archivo(archivo, nombre_archivo: str) -> pd.DataFrame:
     """
     datos = archivo.read() if hasattr(archivo, "read") else open(archivo, "rb").read()
     nombre = nombre_archivo.lower()
+    encabezado_raw = ""
 
     if nombre.endswith(".xlsx"):
         df = pd.read_excel(io.BytesIO(datos), skiprows=FILAS_ENCABEZADO, dtype=str)
+        try:
+            df_head = pd.read_excel(io.BytesIO(datos), nrows=FILAS_ENCABEZADO, header=None, dtype=str)
+            encabezado_raw = df_head.to_string().upper()
+        except Exception:
+            pass
     elif nombre.endswith(".csv"):
         df = None
         for codificacion in ("utf-8-sig", "cp1252"):
@@ -163,6 +169,10 @@ def leer_archivo(archivo, nombre_archivo: str) -> pd.DataFrame:
                     encoding=codificacion,
                     keep_default_na=True,
                 )
+                try:
+                    encabezado_raw = "\n".join(datos.decode(codificacion).splitlines()[:FILAS_ENCABEZADO]).upper()
+                except Exception:
+                    pass
                 break
             except UnicodeDecodeError:
                 continue
@@ -185,7 +195,9 @@ def leer_archivo(archivo, nombre_archivo: str) -> pd.DataFrame:
         df[col] = df[col].astype("string").str.strip()
         df[col] = df[col].where(df[col] != "", pd.NA)
 
-    return df.reset_index(drop=True)
+    df = df.reset_index(drop=True)
+    df.attrs["encabezado_raw"] = encabezado_raw
+    return df
 
 
 # ===========================================================================
@@ -216,6 +228,10 @@ def validar_rfc(df: pd.DataFrame, rfc_esperado: str) -> str:
         )
 
     esperado = str(rfc_esperado).strip().upper()
+    
+    if esperado and esperado in df.attrs.get("encabezado_raw", ""):
+        return "Encabezado del reporte"
+
     emisor = _primer_valor(df, "Emisor RFC")
     receptor = _primer_valor(df, "Receptor RFC")
 
