@@ -1,0 +1,115 @@
+# =============================================================================
+# .gitignore – DSOFT Aplicacion WEB Interna SAP B1
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# SEGURIDAD CRÍTICA: Credenciales y variables de entorno
+# NUNCA deben subirse al repositorio. Contienen contraseñas SAP, URLs
+# internas y configuración sensible del cliente.
+# ---------------------------------------------------------------------------
+.env
+*.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------------------
+# Datos de la empresa
+# Archivos CSV y Excel pueden contener información fiscal confidencial
+# (RFCs, importes, UUIDs de facturas). Se excluyen completamente.
+# ---------------------------------------------------------------------------
+*.csv
+*.xlsx
+*.xls
+*.xlsm
+data/
+uploads/
+
+# ---------------------------------------------------------------------------
+# Entornos virtuales de Python
+# Cada desarrollador genera el suyo propio con: python -m venv venv
+# ---------------------------------------------------------------------------
+venv/
+.venv/
+env/
+.env/
+ENV/
+venv.bak/
+
+# ---------------------------------------------------------------------------
+# Caché de Python
+# Archivos compilados generados automáticamente — no son código fuente.
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ---------------------------------------------------------------------------
+# Distribución y empaquetado
+# ---------------------------------------------------------------------------
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+pip-wheel-metadata/
+MANIFEST
+
+# ---------------------------------------------------------------------------
+# IDEs y editores
+# ---------------------------------------------------------------------------
+# VS Code
+.vscode/
+*.code-workspace
+
+# PyCharm / JetBrains
+.idea/
+
+# Vim / Emacs
+*.swp
+*.swo
+*~
+\#*\#
+
+# ---------------------------------------------------------------------------
+# Sistema operativo
+# ---------------------------------------------------------------------------
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ---------------------------------------------------------------------------
+# Logs y archivos temporales
+# ---------------------------------------------------------------------------
+*.log
+*.tmp
+*.bak
+*.orig
+logs/
+
+# ---------------------------------------------------------------------------
+# Cobertura de tests y herramientas de calidad
+# ---------------------------------------------------------------------------
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------------------------------------------------------------------------
+# Streamlit
+# ---------------------------------------------------------------------------
+.streamlit/secrets.toml
