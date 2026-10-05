@@ -28,7 +28,10 @@ from dotenv import load_dotenv
 #   SAP_PASSWORD   → Contraseña del usuario SAP
 #   SAP_UDT        → Nombre de la tabla de usuario SIN '@', ej. FACTURAS
 # ---------------------------------------------------------------------------
-load_dotenv(Path(__file__).resolve().parent / ".env")
+# override=True: el .env SIEMPRE tiene prioridad sobre variables de entorno de
+# Windows con el mismo nombre (si no, una SAP_COMPANYDB del sistema lo pisaría
+# en silencio y SAP respondería -306).
+load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 PATRON_BATCH_ID = re.compile(r"^LOTE_\d{8}_\d{4}$")
 
@@ -138,7 +141,18 @@ class SAPClient:
             json={"CompanyDB": self.company_db, "UserName": self.user, "Password": self.password},
         )
         if resp.status_code != 200:
-            raise SAPError(f"Error al autenticar en SAP Service Layer. {_mensaje_error(resp)}")
+            detalle = _mensaje_error(resp)
+            # Códigos verificados contra este Service Layer:
+            #   -306 → CompanyDB inexistente o mal escrita (distingue mayúsculas)
+            #   -304 → usuario o contraseña incorrectos
+            if "-306" in detalle:
+                pista = (f" | Causa: SAP no reconoce la base de datos SAP_COMPANYDB='{self.company_db}'. "
+                         "Revisa en el .env que esté escrita EXACTAMENTE igual (mayúsculas incluidas).")
+            elif "-304" in detalle:
+                pista = f" | Causa: usuario o contraseña incorrectos para SAP_USER='{self.user}'."
+            else:
+                pista = ""
+            raise SAPError(f"Error al autenticar en SAP Service Layer. {detalle}{pista}")
         self._autenticado = True
 
     def logout(self) -> None:
