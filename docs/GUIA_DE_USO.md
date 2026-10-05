@@ -193,37 +193,45 @@ Para comprobar que funciona, reinicia el servidor y entra a `http://localhost:85
 
 | Paso | Qué hacer | Qué verás |
 |---|---|---|
-| **1** | Elige la **empresa** en la lista desplegable. | — |
-| **2** | Arrastra o selecciona el **reporte del SAT** (`.csv` o `.xlsx`). | ✅ *"RFC verificado"* o ❌ *"El archivo no pertenece a la empresa…"* |
-| **3** | Revisa la tabla con los datos ya convertidos al formato SAP. | Número de registros, Batch ID y conteo por estatus. |
+| **1** | Elige la **empresa** en la lista desplegable. | Debajo aparece la base de datos SAP destino. |
+| **2** | Arrastra o selecciona **todos los reportes del SAT de esa empresa a la vez** (`.csv` o `.xlsx`), por ejemplo *FACTURAS RECIBIDAS* y *NC RECIBIDAS* juntos. | ✅ *"RFC verificado en 2 archivo(s)"* o ❌ el nombre del archivo que no pertenece a la empresa. |
+| **3** | Revisa la tabla con los datos ya convertidos al formato SAP. | Registros por archivo, total a enviar, Batch ID y conteo por estatus. |
 | *(opcional)* | Presiona **"🔍 Generar Payload de Prueba"**. | Los primeros 3 registros tal como llegarán a SAP. |
-| **4** | Presiona **"🚀 Subir datos a SAP B1"**. | Barra de progreso registro por registro. |
-| **5** | Revisa el resultado. | **Creados / Actualizados / Errores**. Si hubo errores, se muestra el detalle. |
-| **6** | **Anota el Batch ID** que aparece al final. | Ej. `LOTE_20261005_0830` |
+| **4** | Presiona **"🚀 Subir datos a SAP B1"**. | Primero *"Consultando registros existentes"* (~20-30 s) y luego la barra de progreso. |
+| **5** | Revisa el resultado. | **Creados / Actualizados / Sin cambios / Errores** y el tiempo total. Si hubo errores, se muestra el detalle. |
+| **6** | **Anota el Batch ID** que aparece al final. | Ej. `LOTE_20261005_0830` (uno solo para todos los archivos subidos juntos). |
+
+### ¿Cuánto tarda?
+
+Medido con los reportes reales de ERSA (7,728 facturas):
+
+| Situación | Tiempo aproximado |
+|---|---|
+| Primera carga (todas las facturas son nuevas) | **~5-6 minutos** |
+| Volver a subir el mismo archivo (nada cambió) | **~30-45 segundos** |
+| Archivo actualizado con algunos cientos de cambios | **~30-60 segundos** |
+
+La app envía las facturas a SAP en bloques de 100 por petición y **omite las que ya están en SAP idénticas**. Si SAP está muy cargado por otros usuarios, puede tardar un poco más.
 
 ### Reglas del archivo
 
 - Las **primeras 4 filas** del reporte (título, empresa, periodo…) se ignoran automáticamente.
 - Columnas **obligatorias**: `UUID`, `Sello`, `SAT`, `Estatus`, `Emisión`, `Total`, y `Emisor RFC` o `Receptor RFC`.
-- Columnas **opcionales**: se envían solo si vienen en el archivo. Son `Fecha Cancelación`, `Ver`, `Tipo`, `Serie`, `Folio`, `Uso CFDI`, `Emisor RFC`, `Emisor Nombre`, `Conceptos Descripcion`, `Subtotal`, `Descuento`, `IVA`, `Impuesto Local`, `IVA Retenido`, `ISR Retenido`, `Impuesto Local R`, `Tipo Cambio`, `Forma Pago` y `Metodo Pago`.
+- Columnas **opcionales**: se envían solo si vienen en el archivo. Son `Fecha Cancelación`, `Ver`, `Tipo`, `Serie`, `Folio`, `Uso CFDI`, `Emisor RFC`, `Emisor Nombre`, `Conceptos Descripcion`, `Subtotal`, `Descuento`, `IVA`, `Impuesto Local` (o `Impto. Loc. Tras.`), `IVA Retenido`, `ISR Retenido`, `Impuesto Local R` (o `Impto. Loc. Ret.`), `Tipo Cambio`, `Forma Pago` y `Metodo Pago`.
+- Al subir varios archivos juntos, **cada factura solo envía las columnas de su propio archivo**: una Nota de Crédito (que no trae `Forma Pago`) nunca borra ese dato en SAP. Es igual que subirlos por separado.
 - Cualquier otra columna se **ignora**.
-- Las filas sin UUID y los UUID repetidos dentro del archivo se descartan, y la app te avisa cuántos fueron.
+- Las filas sin UUID y los UUID repetidos se descartan, y la app te avisa cuántos fueron.
 
 ### ¿Cómo valida la empresa?
 
-Toma el primer RFC del archivo y lo compara con el de la empresa elegida:
+1. Busca el RFC de la empresa elegida en el **encabezado del reporte** (fila 2, donde el SAT imprime el RFC de la empresa).
+2. Si no está ahí, lo compara con la columna **Emisor RFC** (facturas emitidas) o **Receptor RFC** (facturas recibidas).
 
-- Si coincide con el **Emisor RFC**, significa que son facturas **emitidas** por la empresa.
-- Si coincide con el **Receptor RFC**, significa que son facturas **recibidas** de proveedores.
-
-Si no coincide con ninguno, la carga se bloquea.
-
-> [!IMPORTANT]
-> Para cargar **facturas recibidas**, el reporte debe incluir la columna **`Receptor RFC`**. En esas facturas el emisor es el proveedor, así que sin esa columna la validación las rechazará.
+Si no coincide, la carga se bloquea. Con varios archivos, **cada uno** se valida por separado.
 
 ### ¿Se puede subir el mismo archivo dos veces?
 
-**Sí.** La segunda vez las facturas solo se **actualizan** y no se duplica nada. Esto es útil, por ejemplo, para actualizar facturas que pasaron de *Vigente* a *Cancelado*.
+**Sí.** No se duplica nada: las facturas idénticas se omiten y solo se actualizan los campos que cambiaron (por ejemplo, una factura que pasó de *Vigente* a *Cancelado*). Los campos que se llenan a mano en SAP y que no vienen en el reporte (como `U_PROYECTO` o `U_ODC`) **no se tocan**.
 
 ---
 
